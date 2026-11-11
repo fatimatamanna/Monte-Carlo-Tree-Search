@@ -1,520 +1,866 @@
+#!/usr/bin/env python3
 """
-Human vs 3 MCTS robots - 4-player limit Texas Hold'em
-CSE 3500 - Group 9
+poker_multiplayer.py -- play fixed-limit Texas Hold'em against MCTS robots
+===============================================================================
+CSE 3500, Group 9: Fatima Tamanna, Jayson You, Luka Zorin, Kira Pyvovar
 
-Builds on poker_mcts.py (keep both files in the same folder). That file has the heads-up
-version; this one generalizes the game engine and the MCTS agent to N players (default 4).
+Needs poker_mcts.py in the SAME folder (it imports the hand evaluator, the
+lookup tables, the belief sampler and the MCTS agent from there).
+Pure Python 3, standard library only.
 
-Rules (same fixed-limit style as poker_mcts.py):
-  * Everyone antes 1 chip, gets 2 hole cards; 5 community cards over flop / turn / river.
-  * Actions: FOLD, CALL (call or check), RAISE (bet or raise by the street's fixed size:
-    2 preflop, 2 flop, 4 turn, 4 river). At most 3 raises per street.
-  * The player who acts first rotates every hand. Pot goes to the best hand at showdown
-    (split on ties) or to the last player left if everyone else folds.
-  * Chips are tracked as a running net win/loss, so nobody ever busts.
-
-Robots use single-observer information-set MCTS with UCT. Each iteration samples every
-opponent's hidden cards plus the unseen board, then runs Selection, Expansion, Simulation
-and Backpropagation. Each node stores the reward of the player who moved into it, so
-selection maximizes the reward of whoever is acting (the max^n rule for multiplayer games).
-
-Time complexity: one iteration is O(b * d) with b <= 3 actions and d <= O(P * 4 * (R + 1))
-betting steps (P players, R max raises), a constant for a fixed table. One robot decision
-costs O(I * b * d) = O(I) for I iterations, linear in I, with O(I) memory. The only extra
-cost versus heads-up is the constant factor P.
-
-Usage:
-    python poker_multiplayer.py                   # you vs 3 robots (type f / c / r)
-    python poker_multiplayer.py --iterations 1000 # stronger (slower) robots
-    python poker_multiplayer.py --benchmark       # robots vs a random player, no human
+    python poker_multiplayer.py                    # you vs 3 robots, 10 hands
+    python poker_multiplayer.py --players 6 --hands 20 --iterations 800
+    python poker_multiplayer.py --benchmark        # robot decision timing, O(N)
     python poker_multiplayer.py --selftest
+
+-------------------------------------------------------------------------------
+GAME
+-------------------------------------------------------------------------------
+* 2..6 players (default 4: you plus 3 robots). Everyone antes 1 chip.
+* Same fixed-limit structure as poker_mcts.py: streets preflop/flop/turn/
+  river, bet sizes 2/2/4/4, at most 3 bets+raises per street.
+* Actions: fold (only when facing a bet), check/call, bet/raise.
+* The player who acts first ROTATES every hand (hand 1: seat 0, hand 2:
+  seat 1, ...). On later streets the first player still in the hand at or
+  after that seat acts first.
+* A street ends when everyone still in has acted since the last raise and
+  all bets are equal. If everyone but one folds, that player wins the pot.
+* At showdown the best hand wins; ties SPLIT the pot. If the pot does not
+  divide evenly, the leftover chips go one at a time to the tied winners
+  nearest the first-to-act seat (the usual "odd chip" rule).
+* Only net chips are tracked, so nobody can go broke: no blinds, no
+  all-ins, no side pots.
+
+-------------------------------------------------------------------------------
+ROBOTS: multiplayer information-set MCTS
+-------------------------------------------------------------------------------
+Each robot runs the same MCTSAgent as the heads-up program (UCT selection,
+expansion, rollout, backpropagation, most-visited final move). With N players:
+
+* Determinization samples EVERY opponent's two hidden cards plus the unseen
+  board each iteration. Each opponent's hand is drawn from a belief weighted
+  by that opponent's betting so far (see BeliefSampler in poker_mcts.py),
+  rejecting draws that clash with cards already handed out.
+* Rewards are a vector with one entry per player: net chips divided by
+  (players - 1) * 37, the most anyone can win, so every entry is in [-1, 1].
+* Each node stores the reward of the player who moved INTO it (the max^n
+  rule), so at every node UCT picks the move that is best for whoever is
+  acting there.
+* As in the heads-up agent, every opponent's decision node is split by that
+  opponent's sampled hand-strength bucket, and the tree only grows through
+  the current betting round (later rounds are rollouts). Both choices reduce
+  "strategy fusion"; see the header of poker_mcts.py.
+
+Complexity: one iteration is still O(b*d). The players add constant factors:
+k = 2*(P-1) + 5 hidden cards to sample, P hand evaluations at showdown, and a
+deeper (but bounded) betting tree. One decision is O(N) time and O(N) memory.
+The belief setup costs O(P * H log H) once per decision, with H <= 1225.
 """
 
 import argparse
-import math
 import random
+import statistics
 import sys
 import time
-from bisect import bisect_right
 
 from poker_mcts import (
-    FOLD, CALL, RAISE, ANTE, BET_SIZE, MAX_RAISES, MAX_CONTRIB,
-    evaluate, card_str, rand, Node, _LEGAL, _ROLLOUT_CUM,
+    ANTE, BET_SIZES, MAX_RAISES, MAX_CONTRIB, LEGAL, ROLLOUT_CDF, VISIBLE_BOARD,
+    STREET_NAMES, FOLD, CALL, RAISE,
+    evaluate, describe_hand, card_words, cards_from,
+    partial_shuffle, BeliefSampler, MCTSAgent, HUState, new_deck, tree_size,
 )
 
-HAND_NAMES = ("High card", "Pair", "Two pair", "Three of a kind", "Straight",
-              "Flush", "Full house", "Four of a kind", "Straight flush")
-STREET_NAMES = ("Preflop", "Flop", "Turn", "River")
-BOARD_SIZE = (0, 3, 4, 5)         # community cards visible on each street
 
+# =============================================================================
+# N-player game state (same interface as HUState, so MCTSAgent works on it)
+# =============================================================================
+class NState:
+    """Mutable N-player fixed-limit hand. Moves are applied in place.
 
-def hand_name(cards):
-    return HAND_NAMES[evaluate(cards) // 13 ** 5]
+    cards   : flat list, player p's hole cards at [2p, 2p+1], board at
+              [2n .. 2n+4]. The whole board is dealt up front; only
+              VISIBLE_BOARD[street] cards are face up.
+    contrib : chips each player has put in (ante included)
+    cur     : highest contribution so far (what everyone must match)
+    pending : players who still have to act before the street can end
+    first   : seat that acts first this hand (rotates every hand)
+    """
+    __slots__ = ("n", "cards", "contrib", "folded", "n_active", "street",
+                 "to_act", "first", "cur", "raises", "pending", "terminal",
+                 "_rewards", "history", "scale", "pbucket")
 
-
-RANK_WORDS = ("Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
-              "Jack", "Queen", "King", "Ace")
-SUIT_WORDS = ("Clubs", "Diamonds", "Hearts", "Spades")      # same order as SUITS in poker_mcts
-
-
-def card_long(card):
-    """51 -> 'Ace of Spades'"""
-    return f"{RANK_WORDS[card >> 2]} of {SUIT_WORDS[card & 3]}"
-
-
-def cards_text(cards):
-    return ", ".join(card_long(c) for c in cards)
-
-
-HELP_TEXT = """
-HOW TO PLAY
-  Everyone gets 2 private cards. Up to 5 shared cards (the "table cards") are dealt in
-  stages: the Flop (3 cards), the Turn (1 card) and the River (1 card).
-  Your hand is the best 5 cards you can make from your 2 cards plus the table cards.
-  When betting ends, the best hand left wins the pot. If everyone else folds, you win it.
-
-  f = fold    give up this hand (you lose what you already put in)
-  c = check   stay in for free when nobody has bet, or call to match a bet
-  r = bet     put in more chips (bet when nobody has bet, raise when someone has)
-  h = help    show this message again
-
-HAND RANKS (best to worst)
-  Straight flush > Four of a kind > Full house > Flush > Straight
-  > Three of a kind > Two pair > Pair > High card
-"""
-
-
-# --------------------------------------------------------------------------------------
-# N-player betting state
-# --------------------------------------------------------------------------------------
-class MultiState:
-    """Betting state for N players. Cards live in a separate world = (holes, board)."""
-
-    __slots__ = ("n", "first", "street", "to_act", "contrib", "folded",
-                 "raises", "pending", "active", "done")
-
-    def __init__(self, n, first=0):
-        self.n = n
-        self.first = first               # seat that opens the betting each street
-        self.street = 0
-        self.to_act = first
-        self.contrib = [ANTE] * n
-        self.folded = [False] * n
-        self.raises = 0                  # raises made on this street
-        self.pending = n                 # players who still have to act this street
-        self.active = n                  # players who have not folded
-        self.done = False
-
-    def copy(self):
-        s = MultiState.__new__(MultiState)
-        s.n = self.n
-        s.first = self.first
-        s.street = self.street
-        s.to_act = self.to_act
-        s.contrib = self.contrib[:]
-        s.folded = self.folded[:]
-        s.raises = self.raises
-        s.pending = self.pending
-        s.active = self.active
-        s.done = self.done
+    @classmethod
+    def new_hand(cls, n, deck, first=0):
+        s = cls.__new__(cls)
+        s.n = n
+        s.cards = list(deck[:2 * n + 5])
+        s.contrib = [ANTE] * n
+        s.folded = [False] * n
+        s.n_active = n
+        s.street = 0
+        s.first = first
+        s.to_act = first
+        s.cur = ANTE
+        s.raises = 0
+        s.pending = n
+        s.terminal = False
+        s._rewards = None
+        s.history = []
+        s.scale = float((n - 1) * MAX_CONTRIB)
+        s.pbucket = None
         return s
 
-    def to_call(self):
-        return max(self.contrib) - self.contrib[self.to_act]
+    def copy(self):
+        s = NState.__new__(NState)
+        s.n = self.n
+        s.cards = self.cards[:]
+        s.contrib = self.contrib[:]
+        s.folded = self.folded[:]
+        s.n_active = self.n_active
+        s.street = self.street
+        s.first = self.first
+        s.to_act = self.to_act
+        s.cur = self.cur
+        s.raises = self.raises
+        s.pending = self.pending
+        s.terminal = self.terminal
+        s._rewards = None
+        s.history = None
+        s.scale = self.scale
+        s.pbucket = self.pbucket
+        return s
 
-    def index(self):
-        """Index into the _LEGAL / _ROLLOUT_CUM tables from poker_mcts."""
-        facing = 2 if self.contrib[self.to_act] < max(self.contrib) else 0
-        return facing + (1 if self.raises < MAX_RAISES else 0)
+    @property
+    def n_players(self):
+        return self.n
+
+    # ---- views ------------------------------------------------------------
+    def hole(self, p):
+        return self.cards[2 * p:2 * p + 2]
+
+    def board(self):
+        return self.cards[2 * self.n:2 * self.n + 5]
+
+    def visible_board(self):
+        b = 2 * self.n
+        return self.cards[b:b + VISIBLE_BOARD[self.street]]
+
+    def pot(self):
+        return sum(self.contrib)
+
+    def to_call(self):
+        return self.cur - self.contrib[self.to_act]
 
     def legal_actions(self):
-        return _LEGAL[self.index()]
+        return LEGAL[self.cur > self.contrib[self.to_act]][self.raises < MAX_RAISES]
+
+    def rollout_action(self, u):
+        for threshold, a in ROLLOUT_CDF[self.cur > self.contrib[self.to_act]][self.raises < MAX_RAISES]:
+            if u < threshold:
+                return a
+        return CALL
 
     def _next_active(self, p):
-        folded = self.folded
-        n = self.n
-        for i in range(1, n + 1):
-            q = (p + i) % n
-            if not folded[q]:
-                return q
+        folded, n = self.folded, self.n
+        p = (p + 1) % n
+        while folded[p]:
+            p = (p + 1) % n
         return p
 
-    def apply(self, action):
-        """Apply an action in place."""
+    # ---- transitions -------------------------------------------------------
+    def apply(self, a):
+        """Apply action a for the player to act, in place. O(1) except the
+        skip over folded seats, which is at most P steps."""
         p = self.to_act
-        if action == FOLD:
+        c = self.contrib
+        if self.history is not None:
+            self.history.append((self.street, p, int(self.cur > c[p]),
+                                 int(self.raises < MAX_RAISES), a))
+        if a == FOLD:
             self.folded[p] = True
-            self.active -= 1
-            if self.active == 1:
-                self.done = True
-                return
+            self.n_active -= 1
             self.pending -= 1
-        else:
-            top = max(self.contrib)
-            if action == CALL:
-                self.contrib[p] = top
-                self.pending -= 1
-            else:                                    # RAISE
-                self.contrib[p] = top + BET_SIZE[self.street]
-                self.raises += 1
-                self.pending = self.active - 1       # everyone else must respond
-
-        if self.pending == 0:                        # betting round finished
-            if self.street == 3:
-                self.done = True                     # showdown
+            if self.n_active == 1:
+                self.terminal = True
                 return
+        elif a == CALL:
+            c[p] = self.cur
+            self.pending -= 1
+        else:                                   # RAISE (or bet)
+            self.cur += BET_SIZES[self.street]
+            c[p] = self.cur
+            self.raises += 1
+            self.pending = self.n_active - 1    # everyone else must respond
+        if self.pending == 0:                   # street over
             self.street += 1
+            if self.street == 4:
+                self.terminal = True
+                return
             self.raises = 0
-            self.pending = self.active
-            first = self.first
-            self.to_act = first if not self.folded[first] else self._next_active(first)
-            return
-        self.to_act = self._next_active(p)
+            self.pending = self.n_active
+            self.to_act = self._next_active(self.first - 1)
+        else:
+            self.to_act = self._next_active(p)
 
-    def payoffs(self, world):
-        """Net chips won/lost by each player. Zero-sum. world = (holes, board)."""
-        contrib = self.contrib
-        pot = sum(contrib)
-        result = [-c for c in contrib]
-        if self.active == 1:
-            winner = self.folded.index(False)
-            result[winner] += pot
-            return result
-        holes, board = world
-        best = -1
-        winners = []
-        for i in range(self.n):
-            if self.folded[i]:
+    # ---- results -----------------------------------------------------------
+    def showdown_order(self):
+        """Players still in, in seat order starting from the first actor."""
+        n = self.n
+        return [(self.first + k) % n for k in range(n)
+                if not self.folded[(self.first + k) % n]]
+
+    def winners(self):
+        """(list of winning seats, best score or None if won by folds)."""
+        if self.n_active == 1:
+            return [self.folded.index(False)], None
+        board = self.board()
+        best, win = -1, []
+        for p in self.showdown_order():
+            sc = evaluate(self.hole(p) + board)
+            if sc > best:
+                best, win = sc, [p]
+            elif sc == best:
+                win.append(p)
+        return win, best
+
+    def payoffs(self):
+        """Net chips per player (integers, they always sum to zero)."""
+        pot = sum(self.contrib)
+        pay = [-x for x in self.contrib]
+        win, _ = self.winners()
+        share, rem = divmod(pot, len(win))
+        for i, p in enumerate(win):              # odd chips: first-actor order
+            pay[p] += share + (1 if i < rem else 0)
+        return pay
+
+    def rewards(self):
+        r = self._rewards
+        if r is None:
+            sc = self.scale
+            r = self._rewards = tuple(x / sc for x in self.payoffs())
+        return r
+
+    # ---- determinization ---------------------------------------------------
+    def unseen_pool(self, observer):
+        seen = set(self.hole(observer))
+        seen.update(self.visible_board())
+        return [c for c in range(52) if c not in seen]
+
+    def make_sampler(self, observer):
+        """Built once per decision: the unseen pool and one belief per
+        opponent. Folded opponents cannot win, so their (irrelevant) cards
+        are drawn uniformly; active ones use the betting-weighted belief."""
+        pool = self.unseen_pool(observer)
+        vis = self.visible_board()
+        hist = self.history or []
+        beliefs = []
+        uniform = None
+        for p in range(self.n):
+            if p == observer:
                 continue
-            score = evaluate(holes[i] + board)
-            if score > best:
-                best = score
-                winners = [i]
-            elif score == best:
-                winners.append(i)
-        share = pot / len(winners)
-        for i in winners:
-            result[i] += share
-        return result
+            if not self.folded[p]:
+                acts = [(st, f, cr, a) for st, pl, f, cr, a in hist if pl == p]
+                beliefs.append((p, BeliefSampler(pool, vis, acts, self.street,
+                                                 need_buckets=True)))
+            else:
+                if uniform is None:
+                    uniform = BeliefSampler(pool, vis, [])
+                beliefs.append((p, uniform))
+        return pool, beliefs
+
+    def determinize(self, observer, sampler, rnd):
+        """Copy the state, then give every opponent two cards from their
+        belief (redrawing on a clash with cards already given out) and fill
+        the unseen board from what is left. One copy per iteration.
+        O(P * log H + k) expected."""
+        pool, beliefs = sampler
+        s = self.copy()
+        cards = s.cards
+        used = set()
+        pbucket = [0] * self.n
+        for p, belief in beliefs:
+            for _ in range(30):
+                i = belief.sample_index(rnd())
+                a, b = belief.hands[i]
+                if a not in used and b not in used:
+                    if belief.bucket_now is not None:
+                        pbucket[p] = belief.bucket_now[i]
+                    break
+            else:                       # extremely rare: fall back to uniform
+                partial_shuffle(pool, len(used) + 2, rnd)
+                free = [c for c in pool if c not in used]
+                a, b = free[0], free[1]
+            used.add(a)
+            used.add(b)
+            cards[2 * p] = a
+            cards[2 * p + 1] = b
+        s.pbucket = pbucket
+        vis = VISIBLE_BOARD[self.street]
+        need = 5 - vis
+        if need:
+            partial_shuffle(pool, need + len(used), rnd)
+            j = 2 * self.n + vis
+            end = 2 * self.n + 5
+            for c in pool:
+                if c not in used:
+                    cards[j] = c
+                    j += 1
+                    if j == end:
+                        break
+        return s
 
 
-# --------------------------------------------------------------------------------------
-# Agents
-# --------------------------------------------------------------------------------------
-class MultiMCTSAgent:
-    """Information-set MCTS (UCT) for N players."""
+# =============================================================================
+# Text helpers for the human player
+# =============================================================================
+COMING = (
+    "5  (3 on the Flop, then 1 on the Turn, then 1 on the River)",
+    "2  (1 on the Turn, then 1 on the River)",
+    "1  (the River)",
+    "none, all 5 table cards are out",
+)
+STREET_LONG = ("Preflop (betting round 1 of 4, no table cards yet)",
+               "Flop (betting round 2 of 4)",
+               "Turn (betting round 3 of 4)",
+               "River (betting round 4 of 4, the last one)")
 
-    name = "MCTS"
+RULES = """
+HOW THIS GAME WORKS (fixed-limit Texas Hold'em)
+  * Everyone puts 1 chip (the "ante") into the pot at the start of each hand.
+  * You get 2 private cards. Up to 5 shared "table cards" are dealt face up in
+    three steps: the Flop (3 cards), the Turn (1 card), the River (1 card).
+  * There is a round of betting before the Flop and after each step: 4 rounds.
+  * Bets are a fixed size: 2 chips in the first two rounds, 4 chips in the
+    last two. At most 3 bets/raises are allowed in a round.
+  * Your hand is the best 5 cards you can make from your 2 cards plus the
+    5 table cards. If more than one player is left after the River, everyone
+    shows their cards and the best hand wins the whole pot (ties split it).
+  * If everyone else folds, the last player left wins the pot right away.
+  * Only your net chips are counted, so you can never go broke.
 
-    def __init__(self, iterations=500, c=0.4):
-        self.iterations = iterations
-        self.c = c
+YOUR COMMANDS
+  c = CHECK (stay in for free when nobody has bet), or
+      CALL  (put in just enough chips to match the current bet)
+  r = BET   (be the first to put chips in this round), or
+      RAISE (match the current bet AND add one more bet on top)
+  f = FOLD  (give up this hand; you lose what you already put in).
+      Only offered when you face a bet; when checking is free, folding
+      would just throw the hand away.
+  h = HELP  (show these rules again)
 
-    def choose(self, state, player, hole, visible):
-        legal = state.legal_actions()
-        if len(legal) == 1:
-            return legal[0]
+HAND RANKING, best to worst
+   1. Royal flush      A K Q J 10, all the same suit
+   2. Straight flush   five in a row, all one suit (e.g. 5 6 7 8 9 of Hearts)
+   3. Four of a kind   four cards of the same rank (e.g. four Queens)
+   4. Full house       three of a kind plus a pair (e.g. three 8s, two Kings)
+   5. Flush            any five cards of the same suit
+   6. Straight         five ranks in a row, any suits (A 2 3 4 5 also counts)
+   7. Three of a kind  three cards of the same rank
+   8. Two pair         two different pairs
+   9. Pair             two cards of the same rank
+  10. High card        none of the above; the highest card plays
 
-        n = state.n
-        known = set(hole) | set(visible)
-        unseen = [c for c in range(52) if c not in known]
-        n_unseen = len(unseen)
-        opp_cards = 2 * (n - 1)
-        k = opp_cards + (5 - len(visible))
-        scale = float(MAX_CONTRIB * (n - 1))         # keeps rewards within [-1, 1]
-        root = Node(None)
-
-        for _ in range(self.iterations):
-            # Determinization via partial Fisher-Yates shuffle: O(cards needed).
-            for i in range(k):
-                j = i + int(rand() * (n_unseen - i))
-                unseen[i], unseen[j] = unseen[j], unseen[i]
-            holes = [None] * n
-            idx = 0
-            for q in range(n):
-                if q == player:
-                    holes[q] = hole
-                else:
-                    holes[q] = (unseen[idx], unseen[idx + 1])
-                    idx += 2
-            board = tuple(visible) + tuple(unseen[opp_cards:k])
-            self._iterate(root, state.copy(), (holes, board), scale)
-
-        return max(root.children.items(), key=lambda kv: kv[1].visits)[0]
-
-    def _iterate(self, root, state, world, scale):
-        node = root
-        path = [root]
-
-        # Selection + Expansion
-        while not state.done:
-            if node.untried is None:
-                node.untried = list(state.legal_actions())
-            if node.untried:
-                action = node.untried.pop()
-                actor = state.to_act
-                state.apply(action)
-                child = Node(actor)
-                node.children[action] = child
-                path.append(child)
-                break
-            action, child = self._select(node)
-            state.apply(action)
-            path.append(child)
-            node = child
-
-        # Simulation
-        while not state.done:
-            i = state.index()
-            state.apply(_LEGAL[i][bisect_right(_ROLLOUT_CUM[i], rand())])
-        payoffs = state.payoffs(world)
-
-        # Backpropagation
-        for nd in path:
-            nd.visits += 1
-            if nd.player is not None:
-                nd.total += payoffs[nd.player] / scale
-
-    def _select(self, node):
-        """UCT over the children of `node`. O(b)."""
-        log_n = math.log(node.visits)
-        c = self.c
-        best_score = -1e18
-        best = None
-        for action, child in node.children.items():
-            score = child.total / child.visits + c * math.sqrt(log_n / child.visits)
-            if score > best_score:
-                best_score = score
-                best = (action, child)
-        return best
+  "(all table cards: shared)" next to your hand means the table cards make
+  that hand on their own, so every player still in has it too.
+""".strip("\n")
 
 
-class RandomAgent:
-    name = "Random"
-
-    def choose(self, state, player, hole, visible):
-        i = state.index()
-        return _LEGAL[i][bisect_right(_ROLLOUT_CUM[i], rand())]
+def words(cards):
+    return ", ".join(card_words(c) for c in cards) if cards else ""
 
 
-class HumanAgent:
-    """Console player: type f (fold), c (call/check) or r (bet/raise)."""
+def box(lines):
+    """ASCII box (plain ASCII so it prints the same in every Windows console)."""
+    width = max(len(x) for x in lines)
+    edge = "+" + "-" * (width + 4) + "+"
+    out = [edge] + ["|  " + x.ljust(width) + "  |" for x in lines] + [edge]
+    return "\n".join(out)
 
+
+def chips(n):
+    return "%d chip%s" % (n, "" if n == 1 else "s")
+
+
+def hand_text(hole, board=()):
+    """'Pair  (Pair of Nines)' etc. for 2..7 cards. Adds a warning when the
+    hand comes entirely from the shared table cards, because then every
+    other player has it too (a classic beginner trap)."""
+    sc = evaluate(list(hole) + list(board))
+    text = describe_hand(sc)          # starts with the hand type: "Pair of ..."
+    if len(board) >= 3 and sc >> 20 >= 1:
+        b = evaluate(list(board))
+        if b >> 20 == sc >> 20 and (b >> 16) & 15 == (sc >> 16) & 15:
+            text += "  (all table cards: shared)"
+    return text
+
+
+def card_lines(label, cards, indent):
+    """Print cards three per line so nothing runs past 80 columns."""
+    for i in range(0, len(cards), 3):
+        print((label if i == 0 else " " * len(label)) + words(cards[i:i + 3])
+              + ("," if i + 3 < len(cards) else ""))
+
+
+def describe_action(state, a, you=False):
+    """What an action means, said BEFORE it is applied.
+    you=True gives 'You call 2' instead of 'Robot 1 calls 2'."""
+    owe = state.to_call()
+    size = BET_SIZES[state.street]
+    s = "" if you else "s"
+    if a == FOLD:
+        return "fold" + s
+    if a == CALL:
+        return ("check" + s) if owe == 0 else ("call%s %d" % (s, owe))
+    if owe == 0:
+        return "bet%s %d" % (s, size)
+    return "raise%s (put%s in %d: %d to call + %d more)" % (s, s, owe + size, owe, size)
+
+
+# =============================================================================
+# The interactive game
+# =============================================================================
+class HumanSeat:
     name = "You"
 
-    def __init__(self, names):
-        self.names = names
+    def __init__(self, game):
+        self.game = game
 
-    def _show(self, state, hole, visible):
-        """Print everything the human needs to decide: own cards, table cards, pot, players."""
-        pot = sum(state.contrib)
-        print("\n" + "=" * 60)
-        print(f" YOUR TURN | {STREET_NAMES[state.street]} | Pot: {pot} | To call: {state.to_call()}")
-        print("=" * 60)
-        print(f" Your cards:     {cards_text(hole)}")
-        if visible:
-            more = 5 - len(visible)
-            note = f"   ({more} more shared card{'s' if more != 1 else ''} to come)" if more else ""
-            print(f" Table cards:    {cards_text(visible)}{note}")
-        else:
-            print(" Table cards:    none yet (3 shared cards, the Flop, come after this round)")
-        print(f" Your hand now:  {hand_name(tuple(hole) + tuple(visible))}")
-        print(" Players:")
-        for q in range(state.n):
-            status = "FOLDED" if state.folded[q] else "in hand"
-            print(f"   {self.names[q]:<7} has put in {state.contrib[q]:>3}   {status}")
+    def act(self, state):
+        return self.game.ask_human(state)
 
-    def choose(self, state, player, hole, visible):
-        legal = state.legal_actions()
-        to_call = state.to_call()
-        self._show(state, hole, visible)
 
-        options = []
+class Game:
+    def __init__(self, n_players, hands, iterations, c, seed):
+        self.n = n_players
+        self.hands = hands
+        self.rng = random.Random(seed)
+        self.names = ["You"] + ["Robot %d" % i for i in range(1, n_players)]
+        self.seats = [HumanSeat(self)] + [
+            MCTSAgent(iterations, c, random.Random(seed * 101 + i), name=self.names[i])
+            for i in range(1, n_players)]
+        self.totals = [0] * n_players
+        self.hand_no = 0
+
+    # ---- the human's turn --------------------------------------------------
+    def status_box(self, s):
+        me = 0
+        hole = s.hole(me)
+        vis = s.visible_board()
+        lines = [
+            "YOUR TURN   (hand %d of %d)" % (self.hand_no, self.hands),
+            "Street      : " + STREET_LONG[s.street],
+            "Pot         : %d chips" % s.pot(),
+            "To call     : " + chips(s.to_call()) +
+            ("  (you can check for free)" if s.to_call() == 0 else ""),
+            "Bets/raises : %d of %d used this round" % (s.raises, MAX_RAISES),
+            "",
+            "Your cards  : " + words(hole),
+        ]
+        if not vis:
+            lines.append("Table cards : none yet (the Flop comes after this round)")
+        for i in range(0, len(vis), 3):             # 3 cards per line max
+            lines.append(("Table cards : " if i == 0 else "              ") +
+                         words(vis[i:i + 3]) + ("," if i + 3 < len(vis) else ""))
+        lines += [
+            "More coming : " + COMING[s.street],
+            "Your hand   : " + hand_text(hole, vis),
+            "",
+            "Players     :",
+        ]
+        for p in range(self.n):
+            mark = "  <- first to act this hand" if p == s.first else ""
+            status = "FOLDED" if s.folded[p] else "still in"
+            lines.append("  %-9s put in %-9s %-8s%s"
+                         % (self.names[p], chips(s.contrib[p]), status, mark))
+        return box(lines)
+
+    def ask_human(self, s):
+        legal = s.legal_actions()
+        owe = s.to_call()
+        size = BET_SIZES[s.street]
+        options = {}
         if FOLD in legal:
-            options.append("[f] fold")
-        options.append("[c] call " + str(to_call) if to_call else "[c] check")
+            options["f"] = (FOLD, "f = fold   (give up; you lose the %s you put in)"
+                            % chips(s.contrib[0]))
+        options["c"] = (CALL, "c = check  (put in nothing)" if owe == 0 else
+                        "c = call   (put in %s to match)" % chips(owe))
         if RAISE in legal:
-            amount = to_call + BET_SIZE[state.street]
-            options.append(f"[r] {'raise' if to_call else 'bet'} (puts in {amount})")
-        options.append("[h] help")
-        prompt = "Your move: " + "   ".join(options) + "\n> "
-
+            options["r"] = (RAISE, "r = bet    (put in %d chips)" % size if owe == 0 else
+                            "r = raise  (put in %d chips: %d to call + %d more)" % (owe + size, owe, size))
+        print()
+        print(self.status_box(s))
         while True:
+            print("What do you want to do?")
+            for key in ("f", "c", "r"):
+                if key in options:
+                    print("   " + options[key][1])
+            print("   h = help (rules and hand rankings)")
             try:
-                text = input(prompt).strip().lower()
+                raw = input("Your choice (%s/h): " % "/".join(k for k in "fcr" if k in options))
             except EOFError:
-                print("\nInput closed, exiting.")
-                sys.exit(0)
-            if text[:1] in ("h", "?"):
-                print(HELP_TEXT)
-                self._show(state, hole, visible)
-                continue
-            if text[:1] == "f" and FOLD in legal:
-                return FOLD
-            if text[:1] in ("c", "k"):
+                print("\n(no more input; checking/calling)")
                 return CALL
-            if text[:1] in ("r", "b") and RAISE in legal:
-                return RAISE
-            if text[:1] == "f":
-                print("Nothing to call, so you can just check ('c').")
-            elif text[:1] in ("r", "b"):
-                print("Raise cap reached this street. Choose call or fold.")
+            choice = raw.strip().lower()[:1]
+            if choice == "h":
+                print()
+                print(RULES)
+                print()
+                print(self.status_box(s))
+                continue
+            if choice in options:
+                return options[choice][0]
+            if not choice:
+                print("Please type a letter and press Enter: %s"
+                      % ", ".join(list(options) + ["h"]))
+            elif choice == "f":
+                print("You can't fold right now: nobody has bet, so staying in is free. "
+                      "Type c to check.")
+            elif choice == "r":
+                print("No more raises are allowed this round (the limit is %d)." % MAX_RAISES)
             else:
-                print("Please type f, c or r.")
+                print("Sorry, %r is not an option. Please type one of: %s"
+                      % (raw.strip(), ", ".join(list(options) + ["h"])))
 
+    # ---- one hand -----------------------------------------------------------
+    def play_hand(self):
+        self.hand_no += 1
+        n = self.n
+        first = (self.hand_no - 1) % n          # rotate who acts first
+        s = NState.new_hand(n, new_deck(self.rng), first)
+        print()
+        print("=" * 70)
+        print("HAND %d of %d.  Everyone antes 1 chip (pot: %d).  %s act%s first."
+              % (self.hand_no, self.hands, s.pot(), self.names[first],
+                 "" if first == 0 else "s"))
+        print("Your cards: " + words(s.hole(0)))
+        print("=" * 70)
+        while not s.terminal:
+            p = s.to_act
+            street = s.street
+            a = self.seats[p].act(s)
+            if a not in s.legal_actions():
+                raise RuntimeError("illegal action from " + self.names[p])
+            text = describe_action(s, a, you=(p == 0))
+            s.apply(a)
+            print("  %-9s %s.   (pot is now %d)" % (self.names[p], text, s.pot()))
+            if not s.terminal and s.street != street:
+                vis = s.visible_board()
+                new = vis[VISIBLE_BOARD[street]:]
+                print()
+                print("--- THE %s ---" % STREET_NAMES[s.street].upper())
+                card_lines("    New table card%s: " % ("s " if len(new) > 1 else "  "), new, 0)
+                card_lines("    All table cards : ", vis, 0)
+                if not s.folded[0]:
+                    print("    Your hand now   : " + hand_text(s.hole(0), vis))
+        self.finish_hand(s)
 
-# --------------------------------------------------------------------------------------
-# Running a table
-# --------------------------------------------------------------------------------------
-def describe(name, action, to_call, street):
-    s = "" if name == "You" else "s"
-    if action == FOLD:
-        return f"{name} fold{s}"
-    if action == CALL:
-        return f"{name} check{s}" if to_call == 0 else f"{name} call{s} {to_call}"
-    amount = to_call + BET_SIZE[street]
-    return f"{name} bet{s} {amount}" if to_call == 0 else f"{name} raise{'' if s == '' else 's'} (puts in {amount})"
-
-
-def play_table(agents, names, hands, verbose=True, interactive=False):
-    """Play `hands` hands. Returns the net chips won by each seat."""
-    n = len(agents)
-    net = [0.0] * n
-    for h in range(hands):
-        cards = random.sample(range(52), 2 * n + 5)
-        holes = tuple(tuple(cards[2 * i:2 * i + 2]) for i in range(n))
-        board = tuple(cards[2 * n:2 * n + 5])
-        world = (holes, board)
-        state = MultiState(n, first=h % n)
-
-        if verbose:
-            print(f"\n{'=' * 56}\nHand {h + 1} of {hands}   (first to act: {names[state.first]})")
-
-        while not state.done:
-            p = state.to_act
-            visible = board[:BOARD_SIZE[state.street]]
-            to_call = state.to_call()
-            street_before = state.street
-            action = agents[p].choose(state, p, holes[p], visible)
-            if verbose:
-                print("  >> " + describe(names[p], action, to_call, state.street))
-            state.apply(action)
-            if verbose and not state.done and state.street != street_before:
-                print(f"\n*** {STREET_NAMES[state.street]} dealt. Table cards: " +
-                      cards_text(board[:BOARD_SIZE[state.street]]) + " ***")
-
-        result = state.payoffs(world)
-        for i in range(n):
-            net[i] += result[i]
-
-        if verbose:
-            pot = sum(state.contrib)
-            if state.active == 1:
-                winner = state.folded.index(False)
-                print(f"\n{names[winner]} won the pot of {pot:g} (everyone else folded).")
+    def finish_hand(self, s):
+        n = self.n
+        pay = s.payoffs()
+        win, best = s.winners()
+        print()
+        if best is None:
+            w = win[0]
+            print("Everyone else folded. %s win%s the pot of %d chips."
+                  % (self.names[w], "" if w == 0 else "s", s.pot()))
+        else:
+            print("SHOWDOWN!")
+            card_lines("  Table cards: ", s.board(), 0)
+            for p in s.showdown_order():
+                print("  %-9s: %s" % (self.names[p], words(s.hole(p))))
+                print("  %-9s  -> %s" % ("", describe_hand(evaluate(s.hole(p) + s.board()))))
+            names = " and ".join(self.names[p] for p in win)
+            if len(win) == 1:
+                print("%s win%s the pot of %d chips with %s."
+                      % (names, "" if win[0] == 0 else "s", s.pot(), describe_hand(best)))
             else:
-                print("\nSHOWDOWN. Table cards: " + cards_text(board))
-                for i in range(n):
-                    if not state.folded[i]:
-                        print(f"  {names[i]:<7} {cards_text(holes[i])}  ->  "
-                              f"{hand_name(holes[i] + board)}")
-            print("Hand result:  " + "   ".join(f"{names[i]} {result[i]:+g}" for i in range(n)))
-            print("Running total: " + "   ".join(f"{names[i]} {net[i]:+g}" for i in range(n)))
+                print("TIE! %s split the pot of %d chips (%s)." % (names, s.pot(),
+                                                                    describe_hand(best)))
+        for p in range(n):
+            self.totals[p] += pay[p]
+        print()
+        print("This hand     : " + ",  ".join("%s %+d" % (self.names[p], pay[p]) for p in range(n)))
+        print("Running total : " + ",  ".join("%s %+d" % (self.names[p], self.totals[p])
+                                             for p in range(n)))
 
-        if interactive and h < hands - 1:
-            try:
-                if input("\nPress Enter for the next hand (q to quit): ").strip().lower() == "q":
+    def run(self):
+        print(RULES)
+        print()
+        print("You are playing against %d MCTS robot%s. Good luck!"
+              % (self.n - 1, "" if self.n == 2 else "s"))
+        for h in range(self.hands):
+            self.play_hand()
+            if h < self.hands - 1:
+                try:
+                    ans = input("\nPress Enter for the next hand, or q then Enter to quit: ")
+                except EOFError:
+                    ans = "q"
+                if ans.strip().lower().startswith("q"):
                     break
-            except EOFError:
-                break
-    return net
+        print()
+        print("=" * 70)
+        print("FINAL TOTALS after %d hand%s (best to worst)"
+              % (self.hand_no, "" if self.hand_no == 1 else "s"))
+        for rank, p in enumerate(sorted(range(self.n), key=lambda q: -self.totals[q]), 1):
+            print("  %d. %-9s %+d chips" % (rank, self.names[p], self.totals[p]))
+        print("=" * 70)
 
 
-# --------------------------------------------------------------------------------------
-# Self tests and benchmark
-# --------------------------------------------------------------------------------------
-def selftest():
+# =============================================================================
+# Benchmark: robot decision time vs N
+# =============================================================================
+def benchmark(n, c, seed, repeats=5):
+    """Time one robot decision at increasing N for an n-player table."""
+    from poker_mcts import preflop_equity
+    preflop_equity(0, 4)                    # one-time lookup table
+    rng = random.Random(seed)
+    # Position: seat 0 bets preflop and everyone calls, so every opponent
+    # has acted (and has a belief to build). Seat 0 then decides on the flop.
+    s = NState.new_hand(n, new_deck(rng), 0)
+    s.apply(RAISE)
+    while s.street == 0:
+        s.apply(CALL)
+    print("Benchmark: one robot decision at a %d-player table (%s), median of %d runs"
+          % (n, STREET_NAMES[s.street], repeats))
+    print("'search' excludes the fixed per-decision setup (pool + %d beliefs)." % (n - 1))
+    print("%10s %10s %10s %10s %8s %11s" % ("iterations", "setup ms", "search ms",
+          "us/iter", "ratio", "tree nodes"))
+    prev = None
+    for it in (250, 500, 1000, 2000, 4000):
+        times, setups = [], []
+        for r in range(repeats):
+            agent = MCTSAgent(it, c, random.Random(seed + r))
+            t0 = time.perf_counter()
+            root = agent.search(s, s.to_act)
+            total = time.perf_counter() - t0
+            setups.append(agent.last_setup_seconds)
+            times.append(total - agent.last_setup_seconds)
+        t = statistics.median(times)
+        print("%10d %10.2f %10.1f %10.1f %8s %11d" % (
+            it, 1000 * statistics.median(setups), 1000 * t, 1e6 * t / it,
+            "-" if prev is None else "%.2fx" % (t / prev), tree_size(root)))
+        prev = t
+    print("Doubling N roughly doubles the search time: O(N) per decision, with the")
+    print("number of players only changing the constant factor.")
+
+
+# =============================================================================
+# Self-test
+# =============================================================================
+class RandomMover:
+    """Test helper: picks a uniformly random legal action (to generate
+    thousands of varied hands for the engine tests)."""
+
+    def __init__(self, rng):
+        self.rng = rng
+        self.name = "random-mover"
+
+    def act(self, state):
+        return self.rng.choice(state.legal_actions())
+
+
+class Scripted:
+    """Test helper: plays a fixed list of actions, then always checks/calls."""
+
+    def __init__(self, actions):
+        self.actions = list(actions)
+        self.name = "Scripted"
+
+    def act(self, state):
+        return self.actions.pop(0) if self.actions else CALL
+
+
+def play_with(n, agents, deck, first=0):
+    s = NState.new_hand(n, deck, first)
+    steps = 0
+    while not s.terminal:
+        a = agents[s.to_act].act(s)
+        assert a in s.legal_actions(), "illegal action"
+        s.apply(a)
+        steps += 1
+        assert steps <= 4 * (n + MAX_RAISES * (n - 1)), "hand did not terminate"
+    return s
+
+
+def selftest(seed=777):
+    rng = random.Random(seed)
+    failures = 0
+
+    def check(name, ok, detail=""):
+        nonlocal failures
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", name,
+                               (" -- " + detail) if detail else ""))
+        if not ok:
+            failures += 1
+
+    print("Random play, 2 to 6 players")
     for n in range(2, 7):
-        for _ in range(1500):
-            cards = random.sample(range(52), 2 * n + 5)
-            holes = tuple(tuple(cards[2 * i:2 * i + 2]) for i in range(n))
-            world = (holes, tuple(cards[2 * n:]))
-            state = MultiState(n, first=random.randrange(n))
-            steps = 0
-            while not state.done:
-                state.apply(random.choice(state.legal_actions()))
-                steps += 1
-                assert steps <= 300, "hand did not terminate"
-            pay = state.payoffs(world)
-            assert abs(sum(pay)) < 1e-9, "payoffs must be zero-sum"
-            assert max(abs(x) for x in pay) <= MAX_CONTRIB * (n - 1) + 1e-9
-    # Everybody calls down: all contribute equally, no one can lose more than the ante
-    state = MultiState(4, first=1)
-    while not state.done:
-        state.apply(CALL)
-    assert state.contrib == [1, 1, 1, 1] and state.street == 3
-    # Fold around: last player standing wins everyone else's ante
-    state = MultiState(4, first=0)
-    for _ in range(3):
-        state.apply(FOLD)
-    assert state.done and state.payoffs(None) == [-1, -1, -1, 3]
-    # Robots always return a legal action
-    agent = MultiMCTSAgent(iterations=150)
-    for n in (3, 4):
-        for _ in range(30):
-            cards = random.sample(range(52), 7)
-            state = MultiState(n, first=random.randrange(n))
-            p = state.to_act
-            assert agent.choose(state, p, tuple(cards[:2]), ()) in state.legal_actions()
-    print("All multiplayer self-tests passed.")
+        bad = 0
+        showdowns = folds = 0
+        hands = 2000
+        for h in range(hands):
+            agents = [RandomMover(rng) for _ in range(n)]
+            try:
+                s = play_with(n, agents, new_deck(rng), h % n)
+            except AssertionError:
+                bad += 1
+                continue
+            pay = s.payoffs()
+            live = [s.contrib[p] for p in range(n) if not s.folded[p]]
+            if sum(pay) != 0 or (s.n_active > 1 and len(set(live)) != 1):
+                bad += 1
+            if s.n_active > 1:
+                showdowns += 1
+            else:
+                folds += 1
+        check("%d players: %d random hands terminate, zero-sum, equal live bets"
+              % (n, hands), bad == 0, "%d showdowns, %d won by folds" % (showdowns, folds))
+
+    print("Scripted situations")
+    for n in (3, 4, 6):
+        s = play_with(n, [Scripted([]) for _ in range(n)], new_deck(rng), 1)
+        check("%d players all check down: everyone puts in exactly 1" % n,
+              s.contrib == [1] * n and sum(s.payoffs()) == 0)
+        agents = [Scripted([RAISE] * 4)] + [Scripted([]) for _ in range(n - 1)]
+        s = play_with(n, agents, new_deck(rng), 0)
+        check("%d players: seat 0 bets every street, everyone calls -> equal 13 each" % n,
+              s.contrib == [13] * n, str(s.contrib))
+        agents = [Scripted([RAISE])] + [Scripted([FOLD]) for _ in range(n - 1)]
+        s = play_with(n, agents, new_deck(rng), 0)
+        pay = s.payoffs()
+        check("%d players: bet then fold-around -> bettor wins everyone's ante" % n,
+              pay[0] == n - 1 and all(x == -1 for x in pay[1:]), str(pay))
+        last = n - 1
+        agents = [Scripted([CALL]) for _ in range(n - 1)] + [Scripted([RAISE])]
+        for p in range(n - 1):
+            agents[p] = Scripted([CALL, FOLD])
+        s = play_with(n, agents, new_deck(rng), 0)
+        pay = s.payoffs()
+        check("%d players: checks to the LAST player, who bets; all fold -> +%d"
+              % (n, n - 1), pay[last] == n - 1 and sum(pay) == 0, str(pay))
+
+    # Split pot with an odd chip. Board is a royal flush, so everyone ties.
+    board = cards_from("Ts Js Qs Ks As")
+    holes = cards_from("2c 3d 4c 5d 6c 7d")
+    deck = holes + board + [c for c in range(52) if c not in holes + board]
+    agents = [Scripted([RAISE]), Scripted([CALL]), Scripted([FOLD])]
+    s = play_with(3, agents, deck, 0)
+    pay = s.payoffs()
+    check("split pot: 7 chips between 2 tied players, odd chip to first seat",
+          pay == [1, 0, -1], "payoffs %s, pot %d" % (pay, s.pot()))
+    s = play_with(4, [Scripted([]) for _ in range(4)],
+                  cards_from("2c 3d 4c 5d 6c 7d 8c 9d") + board + list(range(1)), 0)
+    check("4-way tie on a royal-flush board: everyone gets their ante back",
+          s.payoffs() == [0, 0, 0, 0], str(s.payoffs()))
+
+    # First actor rotates and skips folded players on later streets.
+    ok = all(NState.new_hand(5, new_deck(rng), f).to_act == f for f in range(5))
+    s = NState.new_hand(4, new_deck(rng), 2)
+    s.apply(RAISE)          # seat 2 bets
+    s.apply(FOLD)           # seat 3 folds
+    s.apply(CALL)           # seat 0 calls
+    s.apply(CALL)           # seat 1 calls -> flop
+    ok2 = s.street == 1 and s.to_act == 2
+    s2 = NState.new_hand(4, new_deck(rng), 2)
+    s2.apply(RAISE); s2.apply(CALL); s2.apply(CALL); s2.apply(CALL)
+    ok3 = s2.street == 1 and s2.to_act == 2
+    s3 = NState.new_hand(4, new_deck(rng), 3)
+    s3.apply(RAISE); s3.apply(CALL); s3.apply(CALL); s3.apply(FOLD)   # seat 2 folds
+    ok4 = s3.street == 1 and s3.to_act == 3
+    check("first actor rotates and later streets start at the first live seat",
+          ok and ok2 and ok3 and ok4)
+
+    # The N-player engine with 2 players must agree with the heads-up engine.
+    mismatch = 0
+    for _ in range(1000):
+        deck = new_deck(rng)
+        a = HUState.new_hand(deck)
+        b = NState.new_hand(2, deck, 0)
+        while not a.terminal:
+            if a.legal_actions() != b.legal_actions() or a.to_act != b.to_act:
+                mismatch += 1
+                break
+            act = rng.choice(a.legal_actions())
+            a.apply(act)
+            b.apply(act)
+        if not b.terminal or a.payoffs() != b.payoffs():
+            mismatch += 1
+    check("2-player engine matches poker_mcts.HUState on 1000 random hands",
+          mismatch == 0, "%d mismatches" % mismatch)
+
+    print("Robots")
+    ok = True
+    for n in (3, 6):
+        s = NState.new_hand(n, new_deck(rng), 0)
+        for _ in range(200):
+            if s.terminal:
+                s = NState.new_hand(n, new_deck(rng), rng.randrange(n))
+            obs = s.to_act
+            d = s.determinize(obs, s.make_sampler(obs), rng.random)
+            if (d.hole(obs) != s.hole(obs) or d.visible_board() != s.visible_board()
+                    or len(set(d.cards)) != len(d.cards)):
+                ok = False
+            s.apply(rng.choice(s.legal_actions()))
+    check("determinization keeps the robot's view, no duplicate cards (3 and 6 players)", ok)
+    illegal = tested = 0
+    for i in range(150):
+        n = 2 + i % 5
+        s = NState.new_hand(n, new_deck(rng), rng.randrange(n))
+        while not s.terminal and rng.random() < 0.85:
+            s.apply(rng.choice(s.legal_actions()))
+        if s.terminal:
+            continue
+        a = MCTSAgent(40, 0.5, random.Random(i)).act(s)
+        tested += 1
+        if a not in s.legal_actions():
+            illegal += 1
+    check("robots return a legal action in %d random positions (2-6 players)" % tested,
+          illegal == 0)
+    s = NState.new_hand(4, new_deck(rng), 0)
+    root = MCTSAgent(800, 0.5, random.Random(5)).search(s, 0)
+    r = s.copy()
+    while not r.terminal:
+        r.apply(RAISE if RAISE in r.legal_actions() else CALL)
+    check("rewards are in [-1, 1] and visits equal N",
+          root.visits == 800 and all(-1 <= x <= 1 for x in r.rewards()))
+
+    print()
+    print("SELFTEST %s (%d failure%s)" % ("PASSED" if failures == 0 else "FAILED",
+                                          failures, "" if failures == 1 else "s"))
+    return failures == 0
 
 
-def benchmark(hands, iterations, players):
-    """Seat 0 plays randomly, everyone else is an MCTS robot. Robots should win chips."""
-    names = ["Random"] + [f"Bot-{i}" for i in range(1, players)]
-    agents = [RandomAgent()] + [MultiMCTSAgent(iterations) for _ in range(players - 1)]
-    start = time.perf_counter()
-    net = play_table(agents, names, hands, verbose=False)
-    elapsed = time.perf_counter() - start
-    print(f"{players} players, {hands} hands, {iterations} iterations per robot decision")
-    for name, chips in zip(names, net):
-        print(f"  {name:<7} {chips:+9.1f} chips   ({chips / hands:+.2f} per hand)")
-    print(f"  time: {elapsed:.1f}s ({elapsed / hands * 1000:.1f} ms/hand)")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Human vs MCTS robots poker")
-    parser.add_argument("--hands", type=int, default=None, help="number of hands to play")
-    parser.add_argument("--iterations", type=int, default=500, help="MCTS iterations per robot decision")
-    parser.add_argument("--players", type=int, default=4, help="players at the table (2-6)")
-    parser.add_argument("--benchmark", action="store_true", help="robots vs a random player, no human")
-    parser.add_argument("--selftest", action="store_true")
-    parser.add_argument("--seed", type=int, default=None)
-    args = parser.parse_args()
-
-    if args.seed is not None:
-        random.seed(args.seed)
+# =============================================================================
+# Command line
+# =============================================================================
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Play fixed-limit Texas Hold'em against MCTS robots (CSE 3500 Group 9)")
+    ap.add_argument("--hands", type=int, default=10,
+                    help="hands to play (default 10)")
+    ap.add_argument("--iterations", type=int, default=500,
+                    help="robot MCTS iterations per decision (default 500)")
+    ap.add_argument("--players", type=int, default=4,
+                    help="total players including you, 2-6 (default 4)")
+    ap.add_argument("--c", type=float, default=1.0,
+                    help="UCT exploration constant (default 1.0)")
+    ap.add_argument("--benchmark", action="store_true",
+                    help="time one robot decision at 250..4000 iterations")
+    ap.add_argument("--selftest", action="store_true", help="run correctness tests")
+    ap.add_argument("--seed", type=int, default=None, help="random seed")
+    args = ap.parse_args(argv)
     if not 2 <= args.players <= 6:
-        parser.error("--players must be between 2 and 6")
+        ap.error("--players must be between 2 and 6")
+    seed = args.seed if args.seed is not None else random.randrange(1 << 30)
 
     if args.selftest:
-        selftest()
-        return
+        return 0 if selftest() else 1
     if args.benchmark:
-        benchmark(args.hands or 200, args.iterations, args.players)
-        return
-
-    hands = args.hands or 10
-    names = ["You"] + [f"Bot-{i}" for i in range(1, args.players)]
-    agents = [HumanAgent(names)] + [MultiMCTSAgent(args.iterations) for _ in range(args.players - 1)]
-    print(f"Texas Hold'em: you vs {args.players - 1} MCTS robots, {hands} hands. Ante {ANTE}, "
-          f"bet sizes {BET_SIZE}. Everyone starts even; totals are net chips.")
-    print(HELP_TEXT)
-    net = play_table(agents, names, hands, verbose=True, interactive=True)
-    print("\n" + "=" * 56 + "\nFinal totals:")
-    for name, chips in sorted(zip(names, net), key=lambda x: -x[1]):
-        print(f"  {name:<7} {chips:+g}")
+        benchmark(args.players, args.c, seed)
+        return 0
+    Game(args.players, args.hands, args.iterations, args.c, seed).run()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

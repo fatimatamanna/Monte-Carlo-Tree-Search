@@ -6,11 +6,11 @@ Our semester project implements **Monte Carlo Tree Search (MCTS)** for
 fixed-limit Texas Hold'em, with attention to time complexity: one decision
 costs **O(N)** time and **O(N)** memory for N iterations.
 
-- `poker_mcts.py`: the MCTS agent for heads-up (2-player) Hold'em, with the
-  game engine, a single-pass 7-card hand evaluator, a self-play demo, a
-  scaling benchmark and self-tests.
+- `poker_mcts.py`: the game rules (2 to 6 players), a single-pass 7-card hand
+  evaluator, the MCTS agent, a heads-up self-play demo and a scaling benchmark.
 - `poker_multiplayer.py`: play against MCTS robots at a 2 to 6 player table
   (you plus 3 robots by default), with a beginner-friendly text interface.
+- `__test.py`: unit tests for both files (Python's built-in `unittest`).
 
 Both files are pure Python 3 with **no external libraries**. They were tested
 with Python 3.13.
@@ -20,9 +20,10 @@ with Python 3.13.
 ```
 .
 ├── README.md              this file
-├── poker_mcts.py          heads-up engine + MCTS agent (the core algorithm)
-└── poker_multiplayer.py   N-player engine + human-vs-robots game
-                           (imports poker_mcts.py, so keep both in one folder)
+├── poker_mcts.py          game rules + hand evaluator + MCTS agent
+├── poker_multiplayer.py   human-vs-robots game (imports poker_mcts.py)
+└── __test.py              unit tests for both files
+                           (keep all three in the same folder)
 ```
 
 ## How to run
@@ -38,7 +39,6 @@ python poker_mcts.py                                # MCTS plays itself, 5 hands
 python poker_mcts.py --hands 3 --iterations 2000 --seed 7
 python poker_mcts.py --verbose                      # show visits/values per decision
 python poker_mcts.py --benchmark                    # O(N) scaling table
-python poker_mcts.py --selftest                     # correctness tests
 ```
 
 | Flag | Meaning | Default |
@@ -49,7 +49,6 @@ python poker_mcts.py --selftest                     # correctness tests
 | `--seed` | random seed (same seed = same game) | random |
 | `--verbose` | print each root action's visit count and average reward | off |
 | `--benchmark` | time one decision at N = 250, 500, 1000, 2000, 4000 | |
-| `--selftest` | run the evaluator, engine and MCTS tests | |
 
 ### Play against the robots (`poker_multiplayer.py`)
 
@@ -57,7 +56,6 @@ python poker_mcts.py --selftest                     # correctness tests
 python poker_multiplayer.py                         # you vs 3 robots, 10 hands
 python poker_multiplayer.py --players 6 --hands 20 --iterations 800
 python poker_multiplayer.py --benchmark             # robot decision timing
-python poker_multiplayer.py --selftest
 ```
 
 | Flag | Meaning | Default |
@@ -68,7 +66,151 @@ python poker_multiplayer.py --selftest
 | `--c` | UCT exploration constant | 1.0 |
 | `--seed` | random seed | random |
 | `--benchmark` | time one robot decision at N = 250 ... 4000 | |
-| `--selftest` | run the multiplayer tests | |
+
+### Tests
+
+```
+python __test.py          # or: python -m unittest __test -v
+```
+
+During the game, every one of your turns starts with a box that shows the
+street, the pot, the amount to call, your cards and the table cards in words
+("Nine of Clubs, Ten of Spades"), how many table cards are still coming, your
+current hand type, and each player's chips in and whether they folded. Type
+`f` (fold), `c` (check/call), `r` (bet/raise) or `h` (help: rules, commands
+and hand rankings). Only legal options are offered. After each hand you see
+the showdown, the hand result and running totals. Press Enter for the next
+hand or `q` to quit; final totals are printed best to worst.
+
+## The game
+
+Fixed-limit Texas Hold'em, kept small so the betting tree stays bounded:
+
+- 52-card deck, 2 hole cards per player, 5 board cards.
+- Every player antes 1 chip. No blinds, all-ins or side pots; only net chips
+  are tracked, so nobody busts.
+- Four streets (preflop, flop, turn, river) with fixed bets of 2, 2, 4, 4.
+- Actions: fold, call/check, raise/bet. At most 3 bets/raises per street.
+- Heads-up: player 0 always acts first. Multiplayer: the first player to act
+  rotates every hand. Ties split the pot (odd chips go to the winner nearest
+  the first seat).
+
+## How the MCTS works
+
+Each decision runs N iterations of the four classic phases:
+
+1. **Selection**: from the root, while a node is fully expanded, move to the
+   child with the highest UCT score `w/n + C * sqrt(ln(N) / n)`.
+2. **Expansion**: add one untried action as a new child.
+3. **Simulation**: finish the hand with a fast random rollout whose action
+   probabilities come from a lookup table.
+4. **Backpropagation**: walk back up the path. Each node adds the reward of the
+   player who moved into it, so selection always favors the player acting at
+   that node (negamax for 2 players, the max^n rule for more). Rewards are
+   chip results scaled into [-1, 1].
+
+The move played is the **most-visited** root child.
+
+**Hidden cards (information-set MCTS).** Poker hides the opponents' cards and
+the future board, so each iteration first samples a full deal that is
+consistent with what the deciding player can see (**determinization**). All
+samples share **one tree** whose edges are public betting actions
+(single-observer ISMCTS). Legal actions depend only on the public betting, so
+plain UCT works at every node.
+
+Three refinements make the search play sensibly:
+
+- **Belief sampling.** Opponent hands are weighted by how likely they were to
+  produce the opponent's bets so far (Bayes' rule with a "stronger hands bet
+  more" model), so a big raise is not treated as if it could be any two
+  cards.
+- **Opponent splitting.** At an opponent's decision node, the iteration enters
+  one of 5 sub-nodes chosen by the sampled hand's strength bucket. The tree
+  learns that opponents bet strong hands and fold weak ones, which reduces
+  *strategy fusion* (one node averaging over cards a player would actually
+  know).
+- **Tree horizon.** The tree only grows through the current betting round;
+  later streets are covered by rollouts. A deeper tree would store our own
+  future decisions in nodes that average over every possible turn and river
+  card. With the horizon, extra iterations keep improving the decision we
+  actually face.
+
+## Time complexity
+
+Let b ≤ 3 (actions), d ≤ 20 (actions in a hand), k ≤ 7 hidden cards to sample
+(heads-up), and H ≤ 1225 possible opponent hands.
+
+| Phase | Work per iteration |
+|---|---|
+| Determinize: one state copy, opponent hand by binary search on the belief, partial Fisher-Yates for the board | O(k + log H) |
+| Selection: ≤ d levels, ≤ b children each, O(1) opponent split | O(b·d) |
+| Expansion | O(1) |
+| Simulation: ≤ d moves, each a table lookup | O(d) |
+| Evaluation: two single-pass 7-card evaluations | O(7) |
+| Backpropagation | O(d) |
+| **One iteration** | **O(b·d)** |
+
+Because b, d, k and H are bounded constants, one iteration is O(1) and **one
+decision is O(N)**. Each iteration adds at most two nodes, so **memory is
+O(N)**; with the tree horizon it is also capped by the size T of one betting
+round's tree, i.e. O(min(N, T)). Each decision also does a fixed setup that
+does not depend on N: build the unseen-card pool (O(52)) and the belief
+(O(H log H)). With P players, k = 2(P−1) + 5 and showdowns evaluate P hands:
+the player count is a constant factor, so a decision is still O(N).
+
+**Why not full-width minimax?** Before the flop, a player cannot see the
+opponent's 2 cards (C(50,2) = 1,225 options) or the 5 board cards
+(C(48,5) = 1,712,304): about 2.1 × 10⁹ hidden deals. This game's betting tree
+has 4,801 terminal betting sequences, so exhaustive expectimax would touch
+roughly 10¹³ leaves per decision, each needing a hand evaluation. That is
+more than a day per decision even in C, and months in Python. Minimax over
+determinized deals is also unsound for hidden-information games (strategy
+fusion). MCTS is anytime: it gives a usable answer for any budget N.
+
+**Keeping constant factors low:**
+
+- The state is copied once per iteration; moves are then applied in place.
+- Cards are ints (rank = c >> 2, suit = c & 3) in one flat list.
+- Lookup tables cover legal actions, rollout probabilities, straights and
+  top-5 ranks for all 2¹³ rank masks.
+- A single-pass 7-card evaluator uses bitmasks instead of checking all 21
+  five-card subsets.
+- A partial Fisher-Yates shuffle draws only the k hidden cards needed.
+
+### Measured scaling
+
+`python poker_mcts.py --benchmark` (one heads-up preflop decision, best of 3,
+Python 3.13):
+
+| Iterations | ms | Ratio |
+|---:|---:|---:|
+| 250 | 4.1 | – |
+| 500 | 7.7 | 1.87× |
+| 1000 | 12.3 | 1.60× |
+| 2000 | 26.8 | 2.17× |
+| 4000 | 44.7 | 1.67× |
+
+`python poker_multiplayer.py --benchmark` (4 players, robot deciding on the
+flop):
+
+| Iterations | ms | Ratio |
+|---:|---:|---:|
+| 250 | 8.3 | – |
+| 500 | 14.4 | 1.74× |
+| 1000 | 24.4 | 1.69× |
+| 2000 | 51.3 | 2.11× |
+| 4000 | 102.7 | 2.00× |
+
+Doubling N roughly doubles the time, so one decision is O(N). The ratios sit a
+little under 2× at small N because each decision has a fixed setup cost
+(building the guesses about opponents' cards) that does not grow with N.
+Timings vary from run to run and machine to machine.
+
+## Tests
+
+```
+python __test.py          # or: python -m unittest __test -v
+```
 
 During the game, every one of your turns starts with a box that shows the
 street, the pot, the amount to call, your cards and the table cards in words
@@ -209,20 +351,18 @@ machine to machine; the ratios are the point.
 
 ## Tests
 
-`--selftest` in each file checks:
+`__test.py` has 23 unit tests:
 
-- **Evaluator:** ordering of all 9 hand categories, the wheel (A-2-3-4-5) as
-  a Five-high straight, kickers, full house vs full house, straight flush vs
-  four of a kind, and 3,000 random 7-card hands against a brute-force
-  best-of-21 reference evaluator (0 mismatches).
-- **Heads-up engine:** 2,000 random hands end within 20 actions with zero-sum
-  payoffs; the determinization keeps what the player can see and never
-  duplicates a card.
-- **Multiplayer engine:** 2,000 random hands for each table size from 2 to 6
-  players end with zero-sum payoffs; everyone calling down puts in equal
-  chips; a fold-around gives the last player everyone's ante; split pots
-  including the odd chip; first-actor rotation; the 2-player engine matches
-  the heads-up engine on 1,000 random hands.
-- **MCTS:** always returns a legal action (heads-up and 2 to 6 players), root
-  visits equal N, the tree has at most 2N+1 nodes, and rewards stay in
-  [-1, 1].
+- **Hand evaluator:** ordering of all 9 hand types, the wheel (A-2-3-4-5),
+  kickers, full house vs full house, straight flush vs four of a kind, and
+  1,000 random 7-card hands checked against a brute-force best-of-21 scorer.
+- **Heads-up game:** 2,000 random hands end with zero-sum payoffs, check-check
+  ends a street, folding, and the raise cap.
+- **Multiplayer game:** 1,000 random hands for each table size from 2 to 6
+  players; everyone calling gives equal contributions; a fold-around gives the
+  last player everyone's ante; split pot with an odd chip; first player rotates.
+- **MCTS:** always returns a legal action, visits add up to N, rewards stay
+  in [-1, 1], sampled deals never change what the player can see, and it
+  never folds four Aces.
+- **Human interface:** the status box spells out cards in words, invalid input
+  re-prompts, and a full game runs to the final totals.
